@@ -87,11 +87,16 @@ def upsert(collection, docs):
     print(f"{collection.name}: {len(docs)} upserted, {removed} removed")
 
 
-def load():
+def connect():
     load_dotenv()
-    with MongoClient(os.environ["MONGODB_URI"], server_api=ServerApi(version="1", strict=True, deprecation_errors=True)) as client:
-        client.admin.command("ping")
-        print("Connected to MongoDB")
+    client = MongoClient(os.environ["MONGODB_URI"], server_api=ServerApi(version="1", strict=True, deprecation_errors=True))
+    client.admin.command("ping")
+    print("Connected to MongoDB")
+    return client
+
+
+def load():
+    with connect() as client:
         db = client[os.environ.get("MONGODB_DB", "ufc")]
 
         upsert(db.events, build_events())
