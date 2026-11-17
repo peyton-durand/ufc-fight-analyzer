@@ -62,6 +62,19 @@ def clean_event():
 
 
 # fight.csv -------------------------------------------------------------------------------------------
+# Scheduled round lengths in seconds from time_format, e.g. "3 Rnd (5-5-5)" -> [300, 300, 300] or "1 Rnd + OT (12-3)" -> [720, 180]
+# "No Time Limit" fights have no lengths; they all ended in round 1
+def round_lengths(time_format):
+    m = re.search(r"\(([\d-]+)\)", time_format)
+    return [int(x) * 60 for x in m.group(1).split("-")] if m else []
+
+
+# "M:SS" clock time to seconds
+def clock_seconds(t):
+    mins, secs = map(int, t.split(":"))
+    return mins * 60 + secs
+
+
 def clean_fight():
     print("\nCleaning fight.csv...")
     df = pd.read_csv(f'{RAW}/fight.csv')
@@ -83,12 +96,8 @@ def clean_fight():
     print(f"\nWeight classes: {sorted(df['weight_class'].unique())}")
 
     # Fight duration in seconds: full rounds before the last one plus the time in the last round
-    # Round lengths come from time_format, e.g. "3 Rnd (5-5-5)" or "1 Rnd + OT (12-3)"; "No Time Limit" fights all ended in round 1
     def fight_seconds(row):
-        m = re.search(r"\(([\d-]+)\)", row["time_format"])
-        lengths = [int(x) for x in m.group(1).split("-")] if m else []
-        mins, secs = map(int, row["time"].split(":"))
-        return sum(lengths[:row["round"] - 1]) * 60 + mins * 60 + secs
+        return sum(round_lengths(row["time_format"])[:row["round"] - 1]) + clock_seconds(row["time"])
 
     df["fight_seconds"] = df.apply(fight_seconds, axis=1)
 
@@ -204,16 +213,19 @@ def clean_round():
     df = df[keep].copy()
 
     # Control time "M:SS" to seconds. Nulls are 1993-1999 fights where control time wasn't tracked, so they stay null
-    def to_seconds(t):
-        if pd.isna(t):
-            return pd.NA
-        mins, secs = map(int, t.split(":"))
-        return mins * 60 + secs
-
     for prefix in ["r", "b"]:
-        df[f"{prefix}_ctrl_sec"] = df[f"{prefix}_ctrl"].apply(to_seconds).astype("Int64")
+        df[f"{prefix}_ctrl_sec"] = df[f"{prefix}_ctrl"].apply(lambda t: pd.NA if pd.isna(t) else clock_seconds(t)).astype("Int64")
     df = df.drop(columns=["r_ctrl", "b_ctrl"])
     print(f"Rounds with no control time: {df['r_ctrl_sec'].isna().sum()}")
+
+    # Round duration: rounds before the fight's last round run their full scheduled length, the last round runs the fight's time
+    def round_seconds(row):
+        fight = fights.loc[row["fight_id"]]
+        if row["round_no"] == fight["round"]:
+            return clock_seconds(fight["time"])
+        return round_lengths(fight["time_format"])[row["round_no"] - 1]
+
+    df["round_seconds"] = df.apply(round_seconds, axis=1)
 
     # Sanity checks
     assert not df.duplicated(["fight_id", "round_no"]).any(), "Duplicate (fight_id, round_no)"
@@ -228,6 +240,10 @@ def clean_round():
 
     for landed, atmp in landed_atmp_pairs(df.columns):
         assert (df[landed] <= df[atmp]).all(), f"{landed} > {atmp}"
+
+    assert df["round_seconds"].gt(0).all(), "Non-positive round duration"
+    total = df.groupby("fight_id")["round_seconds"].sum()
+    assert (total == fights.loc[total.index, "fight_seconds"]).all(), "Round durations don't sum to fight_seconds"
 
     df = df.sort_values(["fight_id", "round_no"])
 

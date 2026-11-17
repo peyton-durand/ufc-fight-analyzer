@@ -6,7 +6,7 @@ import os
 import sys
 from datetime import datetime
 import pandas as pd
-from load import connect, CLEAN
+from load import connect, CLEAN, STYLE
 
 WEIGHT_CLASSES = [
     "Flyweight", "Bantamweight", "Featherweight", "Lightweight", "Welterweight", "Middleweight",
@@ -144,6 +144,49 @@ def check_rounds(db):
     ]))
 
 
+# Style clusters from style_analysis.py (skipped if it hasn't been run) -------------------------------
+def check_style(db):
+    print("\nStyle")
+    if not os.path.exists(STYLE):
+        print(f"  [SKIP] {STYLE} not found (run style_analysis.py --k N, then load.py)")
+        return
+
+    df = pd.read_csv(STYLE)
+    actual = db.fighters.count_documents({"style": {"$exists": True}})
+    check(f"fighters with a style: {actual}, expected {len(df)}", abs(actual - len(df)))
+
+    # Fields from an older style format; load.py replaces whole documents, so none should be left
+    check("no leftover style fields from older loads", db.fighters.count_documents({"$or": [
+        {f"style.{field}": {"$exists": True}} for field in ["secondary", "hybrid_score"]
+    ]}))
+
+    # Features vary by results file, so the checks follow the columns it has
+    shares = [c for c in df.columns if c.endswith("_share")]
+    check(f"every share is between 0 and 1 ({len(shares)} shares)", db.fighters.count_documents({"$or": [
+        {f"style.features.{s}": {"$exists": True, "$not": {"$gte": 0, "$lte": 1}}} for s in shares
+    ]}))
+    rates = [c for c in ["kd_per_15", "rev_per_15"] if c in df.columns]
+    if rates:
+        check(f"{', '.join(rates)} >= 0", db.fighters.count_documents({"$or": [
+            {f"style.features.{r}": {"$exists": True, "$not": {"$gte": 0}}} for r in rates
+        ]}))
+
+    # Shares are rounded to 3 decimals in load.py, so each group sums to 1 within rounding
+    def off_by(group):
+        return {"$gt": [{"$abs": {"$subtract": [{"$add": [f"$style.features.{s}" for s in group]}, 1]}}, 0.01]}
+
+    for name, group in [("target", ["head_share", "body_share", "leg_share"]),
+                        ("position", ["distance_share", "clinch_share", "ground_share"])]:
+        if set(group) <= set(df.columns):
+            check(f"{name} shares ({'+'.join(s.removesuffix('_share') for s in group)}) sum to 1",
+                  db.fighters.count_documents({"style": {"$exists": True}, "$expr": off_by(group)}))
+    check("fights_used >= 3", db.fighters.count_documents(
+        {"style": {"$exists": True}, "style.fights_used": {"$not": {"$gte": 3}}}
+    ))
+    fighter_keys = {tuple(ix["key"].keys()) for ix in db.fighters.list_indexes()}
+    check("fighters.style.cluster index", int(("style.cluster",) not in fighter_keys))
+
+
 # Types and value ranges ------------------------------------------------------------------------------
 def check_types(db):
     print("\nTypes and ranges")
@@ -182,7 +225,7 @@ def check_indexes(db):
 def show_examples(db):
     print("\nQueries")
 
-    latest = db.events.find_one(sort=[("date", -1)])
+    latest = db.events.find_one(sort=[("date", -1), ("name", 1)])   # same-day events: alphabetical
     card = db.fights.count_documents({"event.id": latest["_id"]})
     print(f"  Latest event: {latest['name']} ({latest['date']:%Y-%m-%d}, {latest['city']}) - {card} fights")
 
@@ -193,7 +236,7 @@ def show_examples(db):
             "wins": {"$sum": {"$cond": [{"$eq": ["$fighters.outcome", "win"]}, 1, 0]}},
             "losses": {"$sum": {"$cond": [{"$eq": ["$fighters.outcome", "loss"]}, 1, 0]}},
         }},
-        {"$sort": {"wins": -1}},
+        {"$sort": {"wins": -1, "_id": 1}},   # ties alphabetical by name
         {"$limit": 5},
     ]))
     print("  Most UFC wins: " + ", ".join(f"{t['_id']} ({t['wins']}-{t['losses']})" for t in top))
@@ -203,7 +246,7 @@ def show_examples(db):
         {"$group": {"_id": "$weight_class", "fights": {"$sum": 1},
                     "finishes": {"$sum": {"$cond": [{"$in": ["$method_group", ["KO/TKO", "Submission"]]}, 1, 0]}}}},
         {"$project": {"rate": {"$divide": ["$finishes", "$fights"]}}},
-        {"$sort": {"rate": -1}},
+        {"$sort": {"rate": -1, "_id": 1}},   # ties alphabetical by weight class
     ])
     print("  Finish rate by weight class:")
     for r in finish_rates:
@@ -220,7 +263,7 @@ def show_examples(db):
         {"$unwind": "$corners"},
         {"$group": {"_id": "$corners.fighter.fighter_id", "name": {"$first": "$corners.fighter.name"},
                     "landed": {"$sum": "$corners.landed"}}},
-        {"$sort": {"landed": -1}},
+        {"$sort": {"landed": -1, "name": 1, "_id": 1}},   # ties alphabetical, then by id for shared names
         {"$limit": 5},
     ])
     print("  Most significant strikes landed: " + ", ".join(f"{s['name']} ({s['landed']})" for s in strikers))
@@ -233,6 +276,7 @@ if __name__ == "__main__":
         check_references(db)
         check_fights(db)
         check_rounds(db)
+        check_style(db)
         check_types(db)
         check_indexes(db)
         show_examples(db)

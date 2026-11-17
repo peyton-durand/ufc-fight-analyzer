@@ -3,6 +3,8 @@ Loads the cleaned data from the data/clean directory into MongoDB (events, fight
 Per-round stats from clean_round.csv are embedded in each fight as a "rounds" array.
 If graph_analysis.py has been run, each fighter also gets a "graph" sub-document from
 data/graph_output/fighter_graph_results.csv (component and strongly connected component: id and size).
+If style_analysis.py --k has been run, each clustered fighter also gets a "style" sub-document from
+data/style_output/fighter_style_results.csv (cluster, label, fights used and the style features).
 Re-running is safe: documents are upserted by _id, and documents no longer in the clean data are removed.
 """
 import os
@@ -13,6 +15,7 @@ from pymongo.server_api import ServerApi
 
 CLEAN = "data/clean"
 GRAPH = "data/graph_output/fighter_graph_results.csv"
+STYLE = "data/style_output/fighter_style_results.csv"
 
 
 # Rows as dicts, leaving out null fields (a missing field is the Mongo way to say "no value")
@@ -48,6 +51,17 @@ def build_fighters():
                              "Re-run graph_analysis.py.")
         for doc in docs:
             doc["graph"] = graph[doc["_id"]]
+
+    # Only fighters with enough tracked fights are clustered, so missing style fields are expected
+    style = build_style()
+    if style is not None:
+        unknown = style.keys() - {d["_id"] for d in docs}
+        if unknown:
+            raise SystemExit(f"{STYLE} has {len(unknown)} fighter ids not in {CLEAN}/clean_fighter.csv. "
+                             "Re-run style_analysis.py.")
+        for doc in docs:
+            if doc["_id"] in style:
+                doc["style"] = style[doc["_id"]]
     return docs
 
 
@@ -61,6 +75,29 @@ def build_graph():
         r["id"]: {
             "component": {"id": r["component_id"], "size": int(r["component_size"])},  # weakly connected
             "scc": {"id": r["scc_id"], "size": int(r["scc_size"])},                    # strongly connected
+        }
+        for r in df.to_dict("records")
+    }
+
+
+# Style clusters from style_analysis.py, keyed by fighter id. Optional: fighters load without it.
+# Every column after these is a style feature, so new features need no change here
+STYLE_COLUMNS = ["fighter_id", "feature_set", "cluster", "label", "fights"]
+
+
+def build_style():
+    if not os.path.exists(STYLE):
+        print(f"{STYLE} not found: loading fighters without style fields (run style_analysis.py --k N first)")
+        return None
+    df = pd.read_csv(STYLE, dtype={"fighter_id": str})
+    features = [c for c in df.columns if c not in STYLE_COLUMNS]
+    return {
+        r["fighter_id"]: {
+            "feature_set": r["feature_set"],
+            "cluster": int(r["cluster"]),
+            "label": r["label"],
+            "fights_used": int(r["fights"]),
+            "features": {f: round(float(r[f]), 3) for f in features},
         }
         for r in df.to_dict("records")
     }
@@ -181,6 +218,7 @@ def load():
         db.fighters.create_index([("name", ASCENDING)])
         db.fighters.create_index([("graph.component.id", ASCENDING)])
         db.fighters.create_index([("graph.scc.id", ASCENDING)])
+        db.fighters.create_index([("style.cluster", ASCENDING)])
         print("Indexes created")
 
 
