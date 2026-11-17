@@ -142,9 +142,10 @@ def check_indexes(db):
     check("fighters.name", int(("name",) not in fighter_keys))
 
 
-# Example queries, printed for a quick eyeball check ---------------------------------------------------
+
+# Database queries ------------------------------------------------------------------------------------
 def show_examples(db):
-    print("\nExamples")
+    print("\nQueries")
 
     latest = db.events.find_one(sort=[("date", -1)])
     card = db.fights.count_documents({"event.id": latest["_id"]})

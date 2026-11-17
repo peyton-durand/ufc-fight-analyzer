@@ -1,5 +1,7 @@
 """
 Loads the cleaned data from the data/clean directory into MongoDB (events, fighters, fights collections).
+If graph_analysis.py has been run, each fighter also gets a "graph" sub-document from
+data/graph_output/fighter_graph_results.csv (component and strongly connected component: id and size).
 Re-running is safe: documents are upserted by _id, and documents no longer in the clean data are removed.
 """
 import os
@@ -9,6 +11,7 @@ from pymongo import MongoClient, ReplaceOne, ASCENDING, DESCENDING
 from pymongo.server_api import ServerApi
 
 CLEAN = "data/clean"
+GRAPH = "data/graph_output/fighter_graph_results.csv"
 
 
 # Rows as dicts, leaving out null fields (a missing field is the Mongo way to say "no value")
@@ -35,7 +38,31 @@ def build_fighters():
     for doc, career in zip(docs, records(df[career_cols])):
         if career:
             doc["career"] = career
+
+    graph = build_graph()
+    if graph is not None:
+        missing = {d["_id"] for d in docs} ^ graph.keys()
+        if missing:
+            raise SystemExit(f"{GRAPH} does not match {CLEAN}/clean_fighter.csv ({len(missing)} ids differ). "
+                             "Re-run graph_analysis.py.")
+        for doc in docs:
+            doc["graph"] = graph[doc["_id"]]
     return docs
+
+
+# Win-graph results from graph_analysis.py, keyed by fighter id. Optional: fighters load without it.
+def build_graph():
+    if not os.path.exists(GRAPH):
+        print(f"{GRAPH} not found: loading fighters without graph fields (run graph_analysis.py first)")
+        return None
+    df = pd.read_csv(GRAPH, dtype={"id": str, "component_id": str, "scc_id": str})
+    return {
+        r["id"]: {
+            "component": {"id": r["component_id"], "size": int(r["component_size"])},  # weakly connected
+            "scc": {"id": r["scc_id"], "size": int(r["scc_size"])},                    # strongly connected
+        }
+        for r in df.to_dict("records")
+    }
 
 
 # fights ----------------------------------------------------------------------------------------------
@@ -108,6 +135,8 @@ def load():
         db.fights.create_index([("event.date", DESCENDING)])
         db.fights.create_index([("weight_class", ASCENDING)])
         db.fighters.create_index([("name", ASCENDING)])
+        db.fighters.create_index([("graph.component.id", ASCENDING)])
+        db.fighters.create_index([("graph.scc.id", ASCENDING)])
         print("Indexes created")
 
 
