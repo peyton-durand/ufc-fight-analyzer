@@ -1,5 +1,6 @@
 """
 Loads the cleaned data from the data/clean directory into MongoDB (events, fighters, fights collections).
+Per-round stats from clean_round.csv are embedded in each fight as a "rounds" array.
 If graph_analysis.py has been run, each fighter also gets a "graph" sub-document from
 data/graph_output/fighter_graph_results.csv (component and strongly connected component: id and size).
 Re-running is safe: documents are upserted by _id, and documents no longer in the clean data are removed.
@@ -74,10 +75,49 @@ def outcome(fighter_id, fight):
     return "win" if fighter_id == fight["winner_id"] else "loss"
 
 
+# One corner's stats for one round, from a clean_round.csv row and its column prefix ("r" or "b")
+def corner_stats(row, p):
+    def pair(landed, atmp):
+        return {"landed": int(row[f"{p}_{landed}"]), "attempted": int(row[f"{p}_{atmp}"])}
+
+    def sig_by(part):
+        return pair(f"sig_str_landed_{part}", f"sig_str_atmp_{part}")
+
+    stats = {
+        "kd": int(row[f"{p}_kd"]),
+        "sig": pair("sig_landed", "sig_atmp"),
+        "total": pair("total_str_landed", "total_str_atmp"),
+        "td": pair("td_success", "td_atmp"),
+        "sub_att": int(row[f"{p}_sub_att"]),
+        "rev": int(row[f"{p}_rev"]),
+        "target": {part: sig_by(part) for part in ["head", "body", "leg"]},
+        "position": {part: sig_by(part) for part in ["distance", "clinch", "ground"]},
+    }
+    # Missing field = no value: control time wasn't tracked in 1993-1999
+    if pd.notna(row[f"{p}_ctrl_sec"]):
+        stats["ctrl_sec"] = int(row[f"{p}_ctrl_sec"])
+    return stats
+
+
+# Rounds keyed by fight id, each list sorted by round number. Corners are on the fight, so r_id/b_id are dropped
+def build_rounds():
+    df = pd.read_csv(f'{CLEAN}/clean_round.csv', dtype={"r_ctrl_sec": "Int64", "b_ctrl_sec": "Int64"})
+    df = df.sort_values(["fight_id", "round_no"])
+    rounds = {}
+    for row in df.to_dict("records"):
+        rounds.setdefault(row["fight_id"], []).append({
+            "round": int(row["round_no"]),
+            "red": corner_stats(row, "r"),
+            "blue": corner_stats(row, "b"),
+        })
+    return rounds
+
+
 def build_fights():
     df = pd.read_csv(f'{CLEAN}/clean_fight.csv')
     events = pd.read_csv(f'{CLEAN}/clean_event.csv', parse_dates=["date"]).set_index("event_id")
     names = pd.read_csv(f'{CLEAN}/clean_fighter.csv').set_index("fighter_id")["fighter_name"]
+    rounds = build_rounds()
 
     df["title_fight"] = df["title_fight"].astype(bool)
     df["is_tournament"] = df["is_tournament"].astype(bool)
@@ -103,6 +143,10 @@ def build_fights():
             for corner, prefix in [("red", "r"), ("blue", "b")]
         ]
         del fight["r_id"], fight["b_id"]
+
+        # Fights with no round data get no rounds field
+        if fight["_id"] in rounds:
+            fight["rounds"] = rounds[fight["_id"]]
         docs.append(fight)
     return docs
 

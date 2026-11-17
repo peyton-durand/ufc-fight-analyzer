@@ -109,6 +109,41 @@ def check_fights(db):
     ))
 
 
+# Per-round stats embedded in fights ------------------------------------------------------------------
+def check_rounds(db):
+    print("\nRounds")
+    df = pd.read_csv(f'{CLEAN}/clean_round.csv')
+
+    expected = df["fight_id"].nunique()
+    actual = db.fights.count_documents({"rounds": {"$exists": True}})
+    check(f"fights with rounds: {actual}, expected {expected}", abs(actual - expected))
+
+    result = list(db.fights.aggregate([{"$group": {"_id": None, "n": {"$sum": {"$size": {"$ifNull": ["$rounds", []]}}}}}]))
+    actual = result[0]["n"] if result else 0
+    check(f"round entries: {actual}, expected {len(df)}", abs(actual - len(df)))
+
+    check("rounds array length equals the fight's round", db.fights.count_documents(
+        {"rounds": {"$exists": True}, "$expr": {"$ne": [{"$size": "$rounds"}, "$round"]}}
+    ))
+
+    # One unwound row per round per corner
+    per_corner = [
+        {"$unwind": "$rounds"},
+        {"$project": {"stats": ["$rounds.red", "$rounds.blue"]}},
+        {"$unwind": "$stats"},
+    ]
+    check("no landed > attempted (sig, total, td, target, position)", count(db.fights, per_corner + [
+        {"$match": {"$expr": {"$or": [
+            {"$gt": [f"$stats.{s}.landed", f"$stats.{s}.attempted"]}
+            for s in ["sig", "total", "td", "target.head", "target.body", "target.leg",
+                      "position.distance", "position.clinch", "position.ground"]
+        ]}}},
+    ]))
+    check("ctrl_sec is >= 0 where present", count(db.fights, per_corner + [
+        {"$match": {"stats.ctrl_sec": {"$exists": True, "$not": {"$gte": 0}}}},
+    ]))
+
+
 # Types and value ranges ------------------------------------------------------------------------------
 def check_types(db):
     print("\nTypes and ranges")
@@ -174,6 +209,22 @@ def show_examples(db):
     for r in finish_rates:
         print(f"    {r['_id']:<22} {r['rate']:.0%}")
 
+    # Red stats go to fighters[0] (red corner), blue stats to fighters[1]
+    strikers = db.fights.aggregate([
+        {"$match": {"rounds": {"$exists": True}}},
+        {"$unwind": "$rounds"},
+        {"$project": {"corners": [
+            {"fighter": {"$arrayElemAt": ["$fighters", 0]}, "landed": "$rounds.red.sig.landed"},
+            {"fighter": {"$arrayElemAt": ["$fighters", 1]}, "landed": "$rounds.blue.sig.landed"},
+        ]}},
+        {"$unwind": "$corners"},
+        {"$group": {"_id": "$corners.fighter.fighter_id", "name": {"$first": "$corners.fighter.name"},
+                    "landed": {"$sum": "$corners.landed"}}},
+        {"$sort": {"landed": -1}},
+        {"$limit": 5},
+    ])
+    print("  Most significant strikes landed: " + ", ".join(f"{s['name']} ({s['landed']})" for s in strikers))
+
 
 if __name__ == "__main__":
     with connect() as client:
@@ -181,6 +232,7 @@ if __name__ == "__main__":
         check_counts(db)
         check_references(db)
         check_fights(db)
+        check_rounds(db)
         check_types(db)
         check_indexes(db)
         show_examples(db)

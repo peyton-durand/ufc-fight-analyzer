@@ -178,8 +178,70 @@ def clean_fighter():
     df.to_csv(f'{CLEAN}/clean_fighter.csv', index=False)
 
 
+# round.csv -------------------------------------------------------------------------------------------
+# Landed/attempted column pairs, e.g. r_sig_landed/r_sig_atmp, r_td_success/r_td_atmp, r_sig_str_landed_head/r_sig_str_atmp_head
+def landed_atmp_pairs(columns):
+    pairs = []
+    for c in columns:
+        for word in ["landed", "success"]:
+            if word in c:
+                pairs.append((c, c.replace(word, "atmp")))
+    return pairs
+
+
+def clean_round():
+    print("\nCleaning round.csv...")
+    df = pd.read_csv(f'{RAW}/round.csv')
+    fights = pd.read_csv(f'{CLEAN}/clean_fight.csv').set_index("fight_id")
+
+    print(f"\nPre-cleaning checks:")
+    print(f"Number of rounds: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
+
+    # Drop rounds from non-UFC fights (requires clean_fight.csv)
+    keep = df["fight_id"].isin(fights.index)
+    print(f"\nDropping {(~keep).sum()} rounds from non-UFC fights")
+    df = df[keep].copy()
+
+    # Control time "M:SS" to seconds. Nulls are 1993-1999 fights where control time wasn't tracked, so they stay null
+    def to_seconds(t):
+        if pd.isna(t):
+            return pd.NA
+        mins, secs = map(int, t.split(":"))
+        return mins * 60 + secs
+
+    for prefix in ["r", "b"]:
+        df[f"{prefix}_ctrl_sec"] = df[f"{prefix}_ctrl"].apply(to_seconds).astype("Int64")
+    df = df.drop(columns=["r_ctrl", "b_ctrl"])
+    print(f"Rounds with no control time: {df['r_ctrl_sec'].isna().sum()}")
+
+    # Sanity checks
+    assert not df.duplicated(["fight_id", "round_no"]).any(), "Duplicate (fight_id, round_no)"
+
+    corners = fights.loc[df["fight_id"], ["r_id", "b_id"]].to_numpy()
+    assert (df[["r_id", "b_id"]].to_numpy() == corners).all(), "Round corners don't match clean_fight.csv"
+
+    by_fight = df.groupby("fight_id")["round_no"]
+    n_rounds = by_fight.size()
+    assert (by_fight.min() == 1).all() and (by_fight.max() == n_rounds).all(), "Round numbers have gaps"
+    assert (n_rounds == fights.loc[n_rounds.index, "round"]).all(), "Number of rounds doesn't match the fight's round"
+
+    for landed, atmp in landed_atmp_pairs(df.columns):
+        assert (df[landed] <= df[atmp]).all(), f"{landed} > {atmp}"
+
+    df = df.sort_values(["fight_id", "round_no"])
+
+    print(f"\nPost-cleaning checks:")
+    print(f"Number of rounds: {len(df)}")
+    print(f"Number of fights with rounds: {df['fight_id'].nunique()}")
+    print(f"Columns: {list(df.columns)}")
+
+    df.to_csv(f'{CLEAN}/clean_round.csv', index=False)
+
+
 
 if __name__ == "__main__":
     clean_event()
     clean_fight()
     clean_fighter()
+    clean_round()
